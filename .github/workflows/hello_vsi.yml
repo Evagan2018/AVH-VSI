@@ -42,12 +42,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - name: Setup Python 3.9
-        uses: actions/setup-python@v5
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.9'
+          python-version: '3.13'
 
       - name: Activate vcpkg
         uses: ARM-software/cmsis-actions/vcpkg@v1
@@ -56,7 +56,7 @@ jobs:
         uses: ARM-software/cmsis-actions/armlm@v1
 
       - name: Cache downloaded packs
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           key: cmsis-packs-download
           path: /home/runner/.cache/arm/packs/.Download
@@ -93,7 +93,7 @@ jobs:
       # Upload build log
       # ----------------------------------------------------------------
       - name: Upload build log for context .${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}.build.log
           path: |
@@ -123,7 +123,7 @@ jobs:
       # Upload FVP UART output log
       # ----------------------------------------------------------------
       - name: Upload FVP UART output for the context ${{ matrix.build.type }}_${{ matrix.target.type }}_${{ matrix.compiler.name }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fvp_stdout_${{ matrix.build.type }}_${{ matrix.target.model }}_${{ matrix.compiler.name }}.simulation.log
           path: ./hello_vsi/fvp_stdout_${{ matrix.build.type }}_${{ matrix.target.model }}_${{ matrix.compiler.name }}.simulation.log
