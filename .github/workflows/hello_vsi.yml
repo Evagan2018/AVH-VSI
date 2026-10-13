@@ -1,129 +1,228 @@
 name: hello_vsi Build & Run
-
-on:
-  workflow_dispatch:
-
-  pull_request:
-    branches: [main]
-    paths:
-      - hello_vsi/**
-  push:
-    branches: [main]
-    paths:
-     - hello_vsi/**
-
-  schedule:
-    - cron: '00 22 * * 0'
-
+'on':
+  workflow_dispatch: null
 jobs:
   CI:
     strategy:
       fail-fast: false
       matrix:
-
-        compiler: [
-          {name: AC6,  ext: axf},
-          {name: GCC,  ext: elf}
-        ]
-
-        target: [
-          {type: Corstone_320,  model: FVP_Corstone_SSE-320,  board: mps4_board},
-          {type: Corstone_315,  model: FVP_Corstone_SSE-315,  board: mps4_board},
-          {type: Corstone_310,  model: FVP_Corstone_SSE-310,  board: mps3_board},
-          {type: Corstone_300,  model: FVP_Corstone_SSE-300,  board: mps3_board}
-        ]
-
-        build: [
-          {type: event},
-          {type: gated}
-        ]
-
+        compiler:
+        - name: AC6
+          ext: axf
+        - name: GCC
+          ext: elf
+        target:
+        - type: Corstone_320
+          model: FVP_Corstone_SSE-320
+          board: mps4_board
+        - type: Corstone_315
+          model: FVP_Corstone_SSE-315
+          board: mps4_board
+        - type: Corstone_310
+          model: FVP_Corstone_SSE-310
+          board: mps3_board
+        - type: Corstone_300
+          model: FVP_Corstone_SSE-300
+          board: mps3_board
+        build:
+        - type: event
+        - type: gated
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        repository: Evagan2018/AVH-VSI
+        ref: cmsis-pack-6.4.0-test-20261013-083944
+    - name: Setup Python 3.14
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.14'
+    - name: Activate vcpkg
+      uses: ARM-software/cmsis-actions/vcpkg@v1
+    - name: Activate Arm tool license
+      uses: ARM-software/cmsis-actions/armlm@v1
+    - name: Cache downloaded packs
+      uses: actions/cache@v6
+      with:
+        key: cmsis-packs-download
+        path: /home/runner/.cache/arm/packs/.Download
+    - name: Initialize CMSIS pack root folder
+      run: |
+        cpackget init https://www.keil.com/pack/index.pidx
+        cpackget update-index
+    - name: Install CMSIS 6.4.0 qualification probe
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        mkdir -p "$RUNNER_TEMP/cmsis-pack-test"
+        cat > "$RUNNER_TEMP/cmsis-pack-test/probe.py" <<'CMSIS_PROBE_EOF'
+        #!/usr/bin/env python3
+        """Ephemeral runner instrumentation for the CMSIS 6.4.0 campaign (stdlib only)."""
+        import json, os, re, shutil, subprocess, sys, time
+        from pathlib import Path
 
-      - name: Setup Python 3.14
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.14'
+        TARGET = 'ARM::CMSIS@6.4.0'
+        HOME = Path(os.environ.get('RUNNER_TEMP', '.')) / 'cmsis-pack-test'
+        WORKSPACE = Path(os.environ.get('GITHUB_WORKSPACE', '.')).resolve()
+        SKIP = {'.git', '.packs', '.Download', 'node_modules', 'boost_1_84_0'}
 
-      - name: Activate vcpkg
-        uses: ARM-software/cmsis-actions/vcpkg@v1
+        def files(root=WORKSPACE):
+            for base, dirs, names in os.walk(root):
+                dirs[:] = [d for d in dirs if d not in SKIP and not Path(base, d).is_symlink()]
+                for name in names:
+                    if name.endswith(('.yml', '.yaml')):
+                        yield Path(base, name)
 
-      - name: Activate Arm tool license
-        uses: ARM-software/cmsis-actions/armlm@v1
+        def pin(text, lock=False):
+            lines = text.splitlines(keepends=True)
+            result = []
+            i = 0
+            key = 'resolved-pack' if lock else 'pack'
+            pattern = re.compile(r'^(\s*)-\s+' + key + r':\s*[\"\x27]?ARM::CMSIS(?=[@\s\"\x27]|$)', re.I)
+            while i < len(lines):
+                match = pattern.match(lines[i])
+                if not match:
+                    result.append(lines[i]); i += 1; continue
+                indent = len(match[1])
+                j = i + 1
+                while j < len(lines):
+                    line = lines[j]
+                    if line.strip() and not line.lstrip().startswith('#') and len(line) - len(line.lstrip()) <= indent:
+                        break
+                    j += 1
+                if not lock:
+                    result.append(match[1] + '- pack: ' + TARGET + '\n')
+                    result.extend(x for x in lines[i+1:j] if not re.match(r'^\s+path:', x))
+                i = j
+            return ''.join(result)
 
-      - name: Cache downloaded packs
-        uses: actions/cache@v6
-        with:
-          key: cmsis-packs-download
-          path: /home/runner/.cache/arm/packs/.Download
+        def prepare():
+            changed = []
+            for path in files():
+                if not path.name.endswith(('.csolution.yml', '.cproject.yml', '.clayer.yml', '.cbuild-pack.yml')):
+                    continue
+                old = path.read_text(encoding='utf-8-sig')
+                new = pin(old, path.name.endswith('.cbuild-pack.yml'))
+                if old != new:
+                    path.write_text(new, encoding='utf-8')
+                    changed.append(str(path.relative_to(WORKSPACE)))
+            return changed
 
-      # ----------------------------------------------------------------
-      # Initialize and update the index of CMSIS packs available online
-      # ----------------------------------------------------------------
-      - name: Initialize CMSIS pack root folder
-        run: |
-          cpackget init https://www.keil.com/pack/index.pidx
-          cpackget update-index
+        def emit(record):
+            HOME.mkdir(parents=True, exist_ok=True)
+            with (HOME/'evidence.jsonl').open('a', encoding='utf-8') as f:
+                f.write(json.dumps(record) + '\n')
+            print('CMSIS_PACK_TEST_RESULT ' + json.dumps(record), flush=True)
 
-      # ----------------------------------------------------------------
-      # Build executable for a specific target compiler pair
-      # ----------------------------------------------------------------
-      - name: Build context .${{ matrix.build.type }}+${{ matrix.target.type }} with ${{ matrix.compiler.name }}
-        working-directory: ./hello_vsi
-        run: |
-            echo "Building Arm Virtual Hardware hello_vsi example with ${{ matrix.compiler.name }} by using the build-type ${{ matrix.build.type }} and the target type ${{ matrix.target.type }}..."
+        def wrapper():
+            args = sys.argv[1:]
+            real = (HOME/'real-cbuild.txt').read_text().strip()
+            if not any('.csolution.' in a for a in args) or any(a in args for a in ['--help', '--version', 'list', 'clean']):
+                return subprocess.call([real] + args)
+            changed = prepare()
+            before = {str(p): p.stat().st_mtime_ns for p in files() if p.name.endswith('.cbuild.yml')}
+            started = time.time()
+            rc = subprocess.call([real] + args)
+            evidence = []
+            for p in files():
+                if not p.name.endswith('.cbuild.yml') or before.get(str(p)) == p.stat().st_mtime_ns:
+                    continue
+                text = p.read_text(encoding='utf-8-sig')
+                packs = sorted(set(re.findall(r'(?:pack|from-pack):\s*[\"\x27]?(ARM::CMSIS@[^\s\"\x27]+)', text)))
+                if packs:
+                    ctx = re.search(r'^\s*context:\s*(.+)$', text, re.M)
+                    evidence.append({'file':str(p.relative_to(WORKSPACE)), 'context':ctx[1].strip() if ctx else p.name,
+                                     'packs':packs, 'verified':packs == [TARGET]})
+            build_action = not any(a in args for a in ['setup', 'convert'])
+            good = bool(evidence) and all(e['verified'] for e in evidence)
+            record = {'kind':'build' if build_action else 'setup','cwd':str(Path.cwd()),'args':args,
+                      'returncode':rc,'version_verified':good,'contexts':evidence,'patched_inputs':changed,
+                      'seconds':round(time.time()-started,2)}
+            emit(record)
+            # Preserve the builder return code. The always-run final check separately rejects
+            # missing/wrong evidence and failures swallowed by upstream scripts.
+            return rc
 
-            cbuild hello_vsi.csolution.yml --packs --rebuild --verbose \
-                --context hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }} \
-                --toolchain ${{ matrix.compiler.name }} \
-                --log hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}.build.log
+        def install():
+            HOME.mkdir(parents=True, exist_ok=True)
+            prepare()
+            bindir = HOME/'bin'; bindir.mkdir(exist_ok=True)
+            if not (HOME/'real-cbuild.txt').exists():
+                real = shutil.which('cbuild')
+                if not real:
+                    raise RuntimeError('cbuild unavailable at qualification setup')
+                (HOME/'real-cbuild.txt').write_text(real)
+                wrapper_path = bindir/'cbuild'
+                wrapper_path.write_text('#!/bin/sh\nexec python3 "' + str(HOME/'probe.py') + '" "$@"\n')
+                wrapper_path.chmod(0o755)
+                with open(os.environ['GITHUB_PATH'], 'a') as f:
+                    f.write(str(bindir)+'\n')
+            print('CMSIS_PACK_TEST_SETUP target=' + TARGET, flush=True)
 
-            if [ $? -eq 0 ]; then
-               echo "Build succeeded"
-            else 
-               echo "Build failed"
-               exit 1
-            fi
+        def finish():
+            path = HOME/'evidence.jsonl'
+            if not path.exists():
+                print('::error::No instrumented cbuild invocation reached; CMSIS 6.4.0 not verified')
+                return 1
+            records = [json.loads(line) for line in path.read_text().splitlines() if line]
+            for r in records:
+                print('CMSIS_PACK_TEST_FINAL ' + json.dumps(r), flush=True)
+            builds = [r for r in records if r['kind']=='build']
+            good = bool(builds) and all(r['returncode']==0 and r['version_verified'] for r in builds)
+            print('CMSIS_PACK_TEST_GATE ' + json.dumps({'passed':good,'build_invocations':len(builds)}))
+            return 0 if good else 1
 
-      # ----------------------------------------------------------------
-      # Upload build log
-      # ----------------------------------------------------------------
-      - name: Upload build log for context .${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}.build.log
-          path: |
-            ./hello_vsi/hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}.build.log
-            ./hello_vsi/tmp/hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}/src/hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}-stamp/hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}-configure-*.log
+        if __name__ == '__main__':
+            if sys.argv[1:] == ['--probe-install']:
+                install()
+            elif sys.argv[1:] == ['--probe-finish']:
+                sys.exit(finish())
+            else:
+                sys.exit(wrapper())
 
-      # ----------------------------------------------------------------
-      # Execute firmware on a model
-      # ----------------------------------------------------------------
-      - name: Execute context .${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }} on ${{ matrix.target.model }}
-        working-directory: ./hello_vsi
-        run: |
-            echo " ${{ matrix.build.type }}_${{ matrix.target.model }} context build with ${{ matrix.compiler }}"
+        CMSIS_PROBE_EOF
+        python3 "$RUNNER_TEMP/cmsis-pack-test/probe.py" --probe-install
+    - name: Build context .${{ matrix.build.type }}+${{ matrix.target.type }} with ${{ matrix.compiler.name }}
+      working-directory: ./hello_vsi
+      run: "echo \"Building Arm Virtual Hardware hello_vsi example with ${{ matrix.compiler.name }} by using the build-type\
+        \ ${{ matrix.build.type }} and the target type ${{ matrix.target.type }}...\"\n\ncbuild hello_vsi.csolution.yml --packs\
+        \ --rebuild --verbose \\\n    --context hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }} \\\n    --toolchain\
+        \ ${{ matrix.compiler.name }} \\\n    --log hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name\
+        \ }}.build.log\n\nif [ $? -eq 0 ]; then\n   echo \"Build succeeded\"\nelse \n   echo \"Build failed\"\n   exit 1\n\
+        fi\n"
+    - name: Upload build log for context .${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}.build.log
+        path: |
+          ./hello_vsi/hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}.build.log
+          ./hello_vsi/tmp/hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}/src/hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}-stamp/hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}-configure-*.log
+    - name: Execute context .${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }} on ${{ matrix.target.model
+        }}
+      working-directory: ./hello_vsi
+      run: |
+        echo " ${{ matrix.build.type }}_${{ matrix.target.model }} context build with ${{ matrix.compiler }}"
 
-            ${{ matrix.target.model }} \
-                -a ./out/hello_vsi/${{ matrix.target.type }}/${{ matrix.build.type }}/${{ matrix.compiler.name }}/hello_vsi.${{ matrix.compiler.ext }} \
-                -f ${{ matrix.target.model }}.txt \
-                -C ${{ matrix.target.board }}.v_path=./source/vsi/data_sensor_py/ \
-                -C ${{ matrix.target.board }}.telnetterminal0.start_telnet=0 \
-                -C ${{ matrix.target.board }}.uart0.out_file=fvp_stdout_${{ matrix.build.type }}_${{ matrix.target.model }}_${{ matrix.compiler.name }}.simulation.log \
-                --timelimit 40 --stat | tee ${{ matrix.build.type }}_${{ matrix.target.type }}_${{ matrix.compiler.name }}.avh.log
+        ${{ matrix.target.model }} \
+            -a ./out/hello_vsi/${{ matrix.target.type }}/${{ matrix.build.type }}/${{ matrix.compiler.name }}/hello_vsi.${{ matrix.compiler.ext }} \
+            -f ${{ matrix.target.model }}.txt \
+            -C ${{ matrix.target.board }}.v_path=./source/vsi/data_sensor_py/ \
+            -C ${{ matrix.target.board }}.telnetterminal0.start_telnet=0 \
+            -C ${{ matrix.target.board }}.uart0.out_file=fvp_stdout_${{ matrix.build.type }}_${{ matrix.target.model }}_${{ matrix.compiler.name }}.simulation.log \
+            --timelimit 40 --stat | tee ${{ matrix.build.type }}_${{ matrix.target.type }}_${{ matrix.compiler.name }}.avh.log
 
-            echo "Checking output..."
-            test "$(grep "FAIL: " ${{ matrix.build.type }}_${{ matrix.target.type }}_${{ matrix.compiler.name }}.avh.log | wc -l)" -eq 0
-
-      # ----------------------------------------------------------------
-      # Upload FVP UART output log
-      # ----------------------------------------------------------------
-      - name: Upload FVP UART output for the context ${{ matrix.build.type }}_${{ matrix.target.type }}_${{ matrix.compiler.name }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: fvp_stdout_${{ matrix.build.type }}_${{ matrix.target.model }}_${{ matrix.compiler.name }}.simulation.log
-          path: ./hello_vsi/fvp_stdout_${{ matrix.build.type }}_${{ matrix.target.model }}_${{ matrix.compiler.name }}.simulation.log
+        echo "Checking output..."
+        test "$(grep "FAIL: " ${{ matrix.build.type }}_${{ matrix.target.type }}_${{ matrix.compiler.name }}.avh.log | wc -l)" -eq 0
+    - name: Upload FVP UART output for the context ${{ matrix.build.type }}_${{ matrix.target.type }}_${{ matrix.compiler.name
+        }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: fvp_stdout_${{ matrix.build.type }}_${{ matrix.target.model }}_${{ matrix.compiler.name }}.simulation.log
+        path: ./hello_vsi/fvp_stdout_${{ matrix.build.type }}_${{ matrix.target.model }}_${{ matrix.compiler.name }}.simulation.log
+    - name: Verify CMSIS 6.4.0 build evidence
+      if: always()
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: python3 "$RUNNER_TEMP/cmsis-pack-test/probe.py" --probe-finish
+run-name: CMSIS 6.4.0 qualification - hello_vsi.yml

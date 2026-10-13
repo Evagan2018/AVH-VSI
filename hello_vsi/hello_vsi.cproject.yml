@@ -1,7 +1,7 @@
 project:
 
   packs:
-    - pack: ARM::CMSIS@6.1.0
+    - pack: ARM::CMSIS@6.4.0
     - pack: ARM::CMSIS-RTX@5.9.0
     - pack: ARM::CMSIS-Compiler@2.1.0
     - pack: ARM::CMSIS-View@1.2.0
