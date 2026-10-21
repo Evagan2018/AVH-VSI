@@ -1,129 +1,226 @@
-name: hello_vsi Build & Run
-
-on:
-  workflow_dispatch:
-
-  pull_request:
-    branches: [main]
-    paths:
-      - hello_vsi/**
-  push:
-    branches: [main]
-    paths:
-     - hello_vsi/**
-
-  schedule:
-    - cron: '00 22 * * 0'
-
+name: GCC 15.3.2 qualification / hello_vsi Build & Run
+'on':
+  workflow_dispatch: null
 jobs:
   CI:
     strategy:
       fail-fast: false
       matrix:
-
-        compiler: [
-          {name: AC6,  ext: axf},
-          {name: GCC,  ext: elf}
-        ]
-
-        target: [
-          {type: Corstone_320,  model: FVP_Corstone_SSE-320,  board: mps4_board},
-          {type: Corstone_315,  model: FVP_Corstone_SSE-315,  board: mps4_board},
-          {type: Corstone_310,  model: FVP_Corstone_SSE-310,  board: mps3_board},
-          {type: Corstone_300,  model: FVP_Corstone_SSE-300,  board: mps3_board}
-        ]
-
-        build: [
-          {type: event},
-          {type: gated}
-        ]
-
+        include:
+        - compiler: &id001
+            name: GCC
+            ext: elf
+          target: &id002
+            type: Corstone_320
+            model: FVP_Corstone_SSE-320
+            board: mps4_board
+          build: &id003
+            type: event
+        - compiler: *id001
+          target: *id002
+          build: &id005
+            type: gated
+        - compiler: *id001
+          target: &id004
+            type: Corstone_315
+            model: FVP_Corstone_SSE-315
+            board: mps4_board
+          build: *id003
+        - compiler: *id001
+          target: *id004
+          build: *id005
+        - compiler: *id001
+          target: &id006
+            type: Corstone_310
+            model: FVP_Corstone_SSE-310
+            board: mps3_board
+          build: *id003
+        - compiler: *id001
+          target: *id006
+          build: *id005
+        - compiler: *id001
+          target: &id007
+            type: Corstone_300
+            model: FVP_Corstone_SSE-300
+            board: mps3_board
+          build: *id003
+        - compiler: *id001
+          target: *id007
+          build: *id005
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        repository: Evagan2018/AVH-VSI
+        ref: gcc-15.3.2-qualification-20261021-133244
+    - name: Setup Python 3.14
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.14'
+    - name: Activate vcpkg
+      uses: ARM-software/cmsis-actions/vcpkg@v1
+    - name: Cache downloaded packs
+      uses: actions/cache@v6
+      with:
+        key: cmsis-packs-download
+        path: /home/runner/.cache/arm/packs/.Download
+    - name: Initialize CMSIS pack root folder
+      run: |
+        cpackget init https://www.keil.com/pack/index.pidx
+        cpackget update-index
+    - name: Install GCC 15.3.2 qualification probe
+      id: gcc_probe
+      if: ${{ !cancelled() }}
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        mkdir -p "$RUNNER_TEMP/gcc-15.3.2-qualification"
+        cat > "$RUNNER_TEMP/gcc-15.3.2-qualification/probe.py" <<'GCC_PROBE_EOF'
+        #!/usr/bin/env python3
+        """GCC qualification instrumentation for Linux runners; standard library only."""
+        import hashlib,json,os,re,shutil,subprocess,sys,time,xml.etree.ElementTree as ET
+        from pathlib import Path
+        TARGET='15.3.2'
+        HOME=Path(os.environ.get('RUNNER_TEMP','.'))/'gcc-15.3.2-qualification'
+        WORKSPACE=Path(os.environ.get('GITHUB_WORKSPACE','.')).resolve()
+        SKIP={'.git','.packs','.Download','node_modules','boost_1_84_0'}
+        def emit(value,announce=True):
+         HOME.mkdir(parents=True,exist_ok=True)
+         with (HOME/'evidence.jsonl').open('a',encoding='utf-8') as f:f.write(json.dumps(value)+'\n')
+         if announce:print('GCC_QUALIFICATION_RESULT '+json.dumps(value),flush=True)
+        def scan(suffix):
+         for base,dirs,names in os.walk(WORKSPACE):
+          dirs[:]=[d for d in dirs if d not in SKIP and not Path(base,d).is_symlink()]
+          for name in names:
+           if name.endswith(suffix):yield Path(base,name)
+        def install():
+         HOME.mkdir(parents=True,exist_ok=True);bindir=HOME/'bin';bindir.mkdir(exist_ok=True)
+         envpath=os.environ.get('GCC_TOOLCHAIN_15_3_2')
+         if not envpath:raise RuntimeError('Exact vcpkg GCC_TOOLCHAIN_15_3_2 export is missing')
+         realgcc=(Path(envpath)/'arm-none-eabi-gcc').resolve()
+         if not realgcc.is_file():raise RuntimeError('GCC artifact export does not resolve to a compiler')
+         version=subprocess.check_output([str(realgcc),'-dumpfullversion'],text=True).strip()
+         banner=subprocess.check_output([str(realgcc),'--version'],text=True).splitlines()[0]
+         info={'kind':'environment','artifact_version':TARGET,'artifact_export':'GCC_TOOLCHAIN_15_3_2','real_compiler':str(realgcc),'dumpfullversion':version,'compiler_banner':banner,'compiler_sha256':hashlib.sha256(realgcc.read_bytes()).hexdigest(),'version_verified':version==TARGET,'vcpkg_exports':{k:v for k,v in os.environ.items() if k.startswith('GCC_TOOLCHAIN_')}}
+         realcbuild=shutil.which('cbuild')
+         config={'compiler_bin':str(realgcc.parent),'cbuild':realcbuild,'environment':info}
+         (HOME/'config.json').write_text(json.dumps(config))
+         for f in realgcc.parent.iterdir():
+          dest=bindir/f.name
+          if not dest.exists():dest.symlink_to(f)
+         # Compiler invocations are retained as JSONL artifacts, not printed individually.
+         probe=Path(__file__).resolve()
+         for tool in ['arm-none-eabi-gcc','arm-none-eabi-g++','cbuild']:
+          if tool=='cbuild' and not realcbuild:continue
+          dest=bindir/tool
+          if dest.exists() or dest.is_symlink():dest.unlink()
+          dest.write_text('#!/usr/bin/env python3\nimport runpy,sys\nns=runpy.run_path('+repr(str(probe))+',run_name="gcc_probe")\nsys.exit(ns["wrapper"]('+repr(tool)+'))\n');dest.chmod(0o755)
+         with open(os.environ['GITHUB_PATH'],'a') as f:f.write(str(bindir)+'\n')
+         with open(os.environ['GITHUB_ENV'],'a') as f:
+          f.write('GCC_TOOLCHAIN_15_3_2='+str(bindir)+'\nGCC_TOOLCHAIN_ROOT='+str(bindir)+'\n')
+          for k in os.environ:
+           if k.startswith('GCC_TOOLCHAIN_') and k not in ('GCC_TOOLCHAIN_15_3_2','GCC_TOOLCHAIN_ROOT'):f.write(k+'=\n')
+         emit(info)
+         if not info['version_verified']:print('::warning::Artifact is labelled 15.3.2 but compiler banner reports '+version,flush=True)
+        def wrapper(tool):
+         cfg=json.loads((HOME/'config.json').read_text());args=sys.argv[1:];start=time.time()
+         if tool=='cbuild':
+          real=cfg['cbuild'];isbuild=any('.csolution.' in a for a in args) and not any(a in args for a in ['setup','list','clean','--help','--version'])
+          if isbuild:
+           if '--toolchain' in args:
+            selected=args[args.index('--toolchain')+1]
+            if selected.split('@')[0].upper()!='GCC':raise RuntimeError('Non-GCC build reached qualification wrapper: '+selected)
+           else:args+=['--toolchain','GCC']
+          before={str(p):p.stat().st_mtime_ns for p in scan('.cbuild.yml')} if isbuild else {}
+          rc=subprocess.call([real]+args)
+          if isbuild:
+           metadata=[]
+           for p in scan('.cbuild.yml'):
+            if before.get(str(p))!=p.stat().st_mtime_ns:
+             text=p.read_text(encoding='utf-8-sig',errors='replace');comp=re.findall(r'^\s*compiler:\s*(.+)$',text,re.M);ctx=re.findall(r'^\s*context:\s*(.+)$',text,re.M)
+             metadata.append({'path':str(p.relative_to(WORKSPACE)),'compiler':comp,'context':ctx})
+           emit({'kind':'build','cwd':str(Path.cwd()),'arguments':args,'exit_code':rc,'duration_seconds':round(time.time()-start,2),'metadata':metadata,'compiler_version':cfg['environment']['dumpfullversion'],'version_verified':cfg['environment']['version_verified']})
+          return rc
+         real=str(Path(cfg['compiler_bin'])/tool);rc=subprocess.call([real]+args)
+         iscompile='-c' in args or '-S' in args or any(a.endswith(('.c','.cpp','.cc','.cxx','.s','.S')) for a in args)
+         if iscompile:emit({'kind':'compiler','tool':tool,'cwd':str(Path.cwd()),'arguments':args,'exit_code':rc,'version_verified':cfg['environment']['version_verified']},False)
+         return rc
+        def finish():
+         records=[json.loads(l) for l in (HOME/'evidence.jsonl').read_text().splitlines()] if (HOME/'evidence.jsonl').exists() else []
+         env=[r for r in records if r['kind']=='environment'];builds=[r for r in records if r['kind']=='build'];compiles=[r for r in records if r['kind']=='compiler']
+         xml=[]
+         for p in scan(('.xunit','.xml')):
+          if 'junit' not in p.name.lower() and not p.name.endswith('.xunit') and p.name!='lit.xml':continue
+          try:
+           root=ET.parse(p).getroot()
+           if root.tag not in ('testsuite','testsuites'):continue
+           failures=sum(1 for t in root.iter() if t.tag in ('failure','error'))
+           xml.append({'path':str(p.relative_to(WORKSPACE)),'failures_or_errors':failures})
+          except ET.ParseError:pass
+         result={'kind':'summary','artifact_version':TARGET,'compiler_versions':sorted({r['dumpfullversion'] for r in env}),'build_calls':len(builds),'failed_build_calls':sum(r['exit_code']!=0 for r in builds),'compiler_calls':len(compiles),'compiler_nonzero_calls':sum(r['exit_code']!=0 for r in compiles),'version_verified':bool(env) and all(r['version_verified'] for r in env),'xml_failure_records':sum(x['failures_or_errors']>0 for x in xml),'xml_reports':xml}
+         # Compiler nonzero calls are not automatically failures: LIT includes negative compile tests.
+         result['qualification_pass']=bool(compiles) and result['version_verified'] and not result['failed_build_calls'] and not result['xml_failure_records']
+         (HOME/'summary.json').write_text(json.dumps(result,indent=2));emit(result)
+         return 0 if result['qualification_pass'] else 1
+        if __name__=='__main__':
+         tool=Path(sys.argv[0]).name
+         if tool in ('cbuild','arm-none-eabi-gcc','arm-none-eabi-g++'):sys.exit(wrapper(tool))
+         if '--install' in sys.argv:install()
+         elif '--finish' in sys.argv:sys.exit(finish())
 
-      - name: Setup Python 3.14
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.14'
+        GCC_PROBE_EOF
+        python3 "$RUNNER_TEMP/gcc-15.3.2-qualification/probe.py" --install
+        echo "ready=true" >> "$GITHUB_OUTPUT"
+    - name: Build context .${{ matrix.build.type }}+${{ matrix.target.type }} with ${{ matrix.compiler.name }}
+      working-directory: ./hello_vsi
+      run: "echo \"Building Arm Virtual Hardware hello_vsi example with ${{ matrix.compiler.name }} by using the build-type ${{ matrix.build.type\
+        \ }} and the target type ${{ matrix.target.type }}...\"\n\ncbuild hello_vsi.csolution.yml --packs --rebuild --verbose \\\n    --context\
+        \ hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }} \\\n    --toolchain ${{ matrix.compiler.name }} \\\n    --log hello_vsi.${{\
+        \ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}.build.log\n\nif [ $? -eq 0 ]; then\n   echo \"Build succeeded\"\
+        \nelse \n   echo \"Build failed\"\n   exit 1\nfi\n"
+      if: ${{ !cancelled() && steps.gcc_probe.outputs.ready == 'true' && (success()) }}
+    - name: Upload build log for context .${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}.build.log
+        path: |
+          ./hello_vsi/hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}.build.log
+          ./hello_vsi/tmp/hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}/src/hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}-stamp/hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}-configure-*.log
+    - name: Execute context .${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }} on ${{ matrix.target.model }}
+      working-directory: ./hello_vsi
+      run: |
+        echo " ${{ matrix.build.type }}_${{ matrix.target.model }} context build with ${{ matrix.compiler }}"
 
-      - name: Activate vcpkg
-        uses: ARM-software/cmsis-actions/vcpkg@v1
+        ${{ matrix.target.model }} \
+            -a ./out/hello_vsi/${{ matrix.target.type }}/${{ matrix.build.type }}/${{ matrix.compiler.name }}/hello_vsi.${{ matrix.compiler.ext }} \
+            -f ${{ matrix.target.model }}.txt \
+            -C ${{ matrix.target.board }}.v_path=./source/vsi/data_sensor_py/ \
+            -C ${{ matrix.target.board }}.telnetterminal0.start_telnet=0 \
+            -C ${{ matrix.target.board }}.uart0.out_file=fvp_stdout_${{ matrix.build.type }}_${{ matrix.target.model }}_${{ matrix.compiler.name }}.simulation.log \
+            --timelimit 40 --stat | tee ${{ matrix.build.type }}_${{ matrix.target.type }}_${{ matrix.compiler.name }}.avh.log
 
-      - name: Activate Arm tool license
-        uses: ARM-software/cmsis-actions/armlm@v1
-
-      - name: Cache downloaded packs
-        uses: actions/cache@v6
-        with:
-          key: cmsis-packs-download
-          path: /home/runner/.cache/arm/packs/.Download
-
-      # ----------------------------------------------------------------
-      # Initialize and update the index of CMSIS packs available online
-      # ----------------------------------------------------------------
-      - name: Initialize CMSIS pack root folder
-        run: |
-          cpackget init https://www.keil.com/pack/index.pidx
-          cpackget update-index
-
-      # ----------------------------------------------------------------
-      # Build executable for a specific target compiler pair
-      # ----------------------------------------------------------------
-      - name: Build context .${{ matrix.build.type }}+${{ matrix.target.type }} with ${{ matrix.compiler.name }}
-        working-directory: ./hello_vsi
-        run: |
-            echo "Building Arm Virtual Hardware hello_vsi example with ${{ matrix.compiler.name }} by using the build-type ${{ matrix.build.type }} and the target type ${{ matrix.target.type }}..."
-
-            cbuild hello_vsi.csolution.yml --packs --rebuild --verbose \
-                --context hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }} \
-                --toolchain ${{ matrix.compiler.name }} \
-                --log hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}.build.log
-
-            if [ $? -eq 0 ]; then
-               echo "Build succeeded"
-            else 
-               echo "Build failed"
-               exit 1
-            fi
-
-      # ----------------------------------------------------------------
-      # Upload build log
-      # ----------------------------------------------------------------
-      - name: Upload build log for context .${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}.build.log
-          path: |
-            ./hello_vsi/hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }}.build.log
-            ./hello_vsi/tmp/hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}/src/hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}-stamp/hello_vsi.${{ matrix.build.type }}+${{ matrix.target.type }}-configure-*.log
-
-      # ----------------------------------------------------------------
-      # Execute firmware on a model
-      # ----------------------------------------------------------------
-      - name: Execute context .${{ matrix.build.type }}+${{ matrix.target.type }}_${{ matrix.compiler.name }} on ${{ matrix.target.model }}
-        working-directory: ./hello_vsi
-        run: |
-            echo " ${{ matrix.build.type }}_${{ matrix.target.model }} context build with ${{ matrix.compiler }}"
-
-            ${{ matrix.target.model }} \
-                -a ./out/hello_vsi/${{ matrix.target.type }}/${{ matrix.build.type }}/${{ matrix.compiler.name }}/hello_vsi.${{ matrix.compiler.ext }} \
-                -f ${{ matrix.target.model }}.txt \
-                -C ${{ matrix.target.board }}.v_path=./source/vsi/data_sensor_py/ \
-                -C ${{ matrix.target.board }}.telnetterminal0.start_telnet=0 \
-                -C ${{ matrix.target.board }}.uart0.out_file=fvp_stdout_${{ matrix.build.type }}_${{ matrix.target.model }}_${{ matrix.compiler.name }}.simulation.log \
-                --timelimit 40 --stat | tee ${{ matrix.build.type }}_${{ matrix.target.type }}_${{ matrix.compiler.name }}.avh.log
-
-            echo "Checking output..."
-            test "$(grep "FAIL: " ${{ matrix.build.type }}_${{ matrix.target.type }}_${{ matrix.compiler.name }}.avh.log | wc -l)" -eq 0
-
-      # ----------------------------------------------------------------
-      # Upload FVP UART output log
-      # ----------------------------------------------------------------
-      - name: Upload FVP UART output for the context ${{ matrix.build.type }}_${{ matrix.target.type }}_${{ matrix.compiler.name }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: fvp_stdout_${{ matrix.build.type }}_${{ matrix.target.model }}_${{ matrix.compiler.name }}.simulation.log
-          path: ./hello_vsi/fvp_stdout_${{ matrix.build.type }}_${{ matrix.target.model }}_${{ matrix.compiler.name }}.simulation.log
+        echo "Checking output..."
+        test "$(grep "FAIL: " ${{ matrix.build.type }}_${{ matrix.target.type }}_${{ matrix.compiler.name }}.avh.log | wc -l)" -eq 0
+    - name: Upload FVP UART output for the context ${{ matrix.build.type }}_${{ matrix.target.type }}_${{ matrix.compiler.name }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: fvp_stdout_${{ matrix.build.type }}_${{ matrix.target.model }}_${{ matrix.compiler.name }}.simulation.log
+        path: ./hello_vsi/fvp_stdout_${{ matrix.build.type }}_${{ matrix.target.model }}_${{ matrix.compiler.name }}.simulation.log
+    - name: Verify GCC 15.3.2 compilation evidence
+      if: always()
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: python3 "$RUNNER_TEMP/gcc-15.3.2-qualification/probe.py" --finish
+    - name: Upload GCC qualification evidence
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: gcc-qualification-${{ github.job }}-${{ strategy.job-index }}
+        path: ${{ runner.temp }}/gcc-15.3.2-qualification/*.json*
+        if-no-files-found: warn
+        retention-days: 14
+    timeout-minutes: 120
+run-name: GCC 15.3.2 / hello_vsi.yml / ${{ github.run_id }}
+permissions:
+  contents: read
